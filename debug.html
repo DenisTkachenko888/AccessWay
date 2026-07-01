@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>MVP 0 - Debug Visualizer</title>
+    <style>
+        body { font-family: system-ui, -apple-system, sans-serif; background: #f4f4f5; padding: 20px; }
+        .container { max-width: 900px; margin: 0 auto; }
+        .card { background: white; border-radius: 8px; padding: 16px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+        .header { display: flex; justify-content: space-between; align-items: baseline; border-bottom: 1px solid #eee; padding-bottom: 8px; margin-bottom: 12px; }
+        .title { margin: 0; font-size: 1.2rem; }
+        .badge { padding: 4px 8px; border-radius: 4px; font-weight: bold; font-size: 0.85rem; text-transform: uppercase; }
+        
+        /* Цветовая кодировка вердиктов */
+        .verdict-unknown { background: #e4e4e7; color: #52525b; }
+        .verdict-likely_accessible { background: #dcfce7; color: #166534; }
+        .verdict-unlikely_accessible { background: #fee2e2; color: #991b1b; }
+        .verdict-partially_accessible { background: #fef9c3; color: #854d0e; }
+        
+        .section { margin-top: 8px; font-size: 0.9rem; }
+        .section strong { display: block; color: #3f3f46; margin-bottom: 4px; }
+        ul { margin: 0; padding-left: 20px; color: #52525b; }
+        .search-box { margin-bottom: 20px; display: flex; gap: 10px; }
+        input, button { padding: 8px; border: 1px solid #ccc; border-radius: 4px; }
+        button { background: #2563eb; color: white; border: none; cursor: pointer; }
+        button:hover { background: #1d4ed8; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2>🛠 Accessibility Finder - Debugger</h2>
+        <div class="search-box">
+            <input type="text" id="lat" value="55.7558" placeholder="Lat">
+            <input type="text" id="lon" value="37.6173" placeholder="Lon">
+            <input type="text" id="cat" value="pharmacy" placeholder="Category">
+            <input type="number" id="rad" value="1000" placeholder="Radius (m)">
+            <button onclick="fetchData()">Run Scoring Engine</button>
+        </div>
+        <div id="results">Задайте параметры и нажмите Run...</div>
+    </div>
+
+    <script>
+        async function fetchData() {
+            const resultsDiv = document.getElementById('results');
+            resultsDiv.innerHTML = 'Загрузка данных из OSM и запуск скоринга...';
+            
+            const lat = document.getElementById('lat').value;
+            const lon = document.getElementById('lon').value;
+            const cat = document.getElementById('cat').value;
+            const rad = document.getElementById('rad').value;
+            const url = `http://127.0.0.1:8000/api/search?lat=${lat}&lon=${lon}&category=${cat}&radius=${rad}`;
+
+            try {
+                const response = await fetch(url);
+                if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+                const data = await response.json();
+                
+                if (data.length === 0) {
+                    resultsDiv.innerHTML = 'Ничего не найдено в этом радиусе.';
+                    return;
+                }
+
+                resultsDiv.innerHTML = data.map(place => `
+                    <div class="card">
+                        <div class="header">
+                            <h3 class="title">${place.name} <span style="font-size: 0.8rem; color: #888;">(OSM: ${place.osm_id})</span></h3>
+                            <span class="badge verdict-${place.scoring.verdict}">
+                                ${place.scoring.verdict} (${place.scoring.confidence})
+                            </span>
+                        </div>
+                        <div class="section">
+                            <strong>Signals Checked: ${place.signals_extracted}</strong>
+                            <ul>
+                                ${place.signals.map(s => `<li>${s.key}: <b>${s.present ? s.value : 'missing'}</b> <span style="color:#a1a1aa; font-size:0.8rem;">(${s.source_detail})</span></li>`).join('')}
+                            </ul>
+                        </div>
+                        ${place.scoring.reasons.length > 0 ? `<div class="section"><strong>Reasons:</strong><ul>${place.scoring.reasons.map(r => `<li>✅ ${r}</li>`).join('')}</ul></div>` : ''}
+                        ${place.scoring.risks.length > 0 ? `<div class="section"><strong>Risks:</strong><ul>${place.scoring.risks.map(r => `<li>⚠️ ${r}</li>`).join('')}</ul></div>` : ''}
+                        ${place.scoring.unknowns.length > 0 ? `<div class="section"><strong>Unknowns:</strong><ul>${place.scoring.unknowns.map(u => `<li>❓ ${u}</li>`).join('')}</ul></div>` : ''}
+                    </div>
+                `).join('');
+            } catch (e) {
+                resultsDiv.innerHTML = `<div style="color:red;">Ошибка подключения к API: ${e.message}. Сервер запущен? CORS настроен?</div>`;
+            }
+        }
+    </script>
+</body>
+</html>
