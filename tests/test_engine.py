@@ -12,7 +12,7 @@ All tests are pure: no I/O, no network, no database.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import pytest
 
@@ -29,7 +29,8 @@ def make_evidence(
     interpreted_value: str,
     present: bool = True,
     confidence: str = "medium",
-    raw_value: str = None,
+    raw_value: Optional[str] = None,
+    freshness_days: Optional[int] = 0,
 ) -> Evidence:
     """Build a minimal Evidence object for testing score() in isolation."""
     return Evidence(
@@ -40,6 +41,7 @@ def make_evidence(
         interpreted_value=interpreted_value,
         present=present,
         confidence=confidence,
+        freshness_days=freshness_days,
     )
 
 
