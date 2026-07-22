@@ -1,0 +1,32 @@
+version: '3.8'
+
+services:
+  web:
+    build: .
+    container_name: accessway_backend
+    ports:
+      - "8000:8000"
+    environment:
+      # Задел на будущее: URL для подключения к базе
+      - DATABASE_URL=postgresql://accessway_user:accessway_password@db:5432/accessway
+    depends_on:
+      - db
+    volumes:
+      # Проброс локального кода в контейнер для hot-reload (изменения применяются сразу)
+      - ./app:/code/app
+
+  db:
+    image: postgis/postgis:16-3.4
+    container_name: accessway_postgis
+    environment:
+      POSTGRES_USER: accessway_user
+      POSTGRES_PASSWORD: accessway_password
+      POSTGRES_DB: accessway
+    ports:
+      - "5432:5432"
+    volumes:
+      # Именованный том, чтобы данные БД не удалялись при перезапуске контейнера
+      - postgis_data:/var/lib/postgresql/data
+
+volumes:
+  postgis_data:
