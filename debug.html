@@ -2,87 +2,313 @@
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
-    <title>MVP 0 - Debug Visualizer</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#0f766e">
+    <title>AccessWay</title>
     <style>
-        body { font-family: system-ui, -apple-system, sans-serif; background: #f4f4f5; padding: 20px; }
-        .container { max-width: 900px; margin: 0 auto; }
-        .card { background: white; border-radius: 8px; padding: 16px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
-        .header { display: flex; justify-content: space-between; align-items: baseline; border-bottom: 1px solid #eee; padding-bottom: 8px; margin-bottom: 12px; }
-        .title { margin: 0; font-size: 1.2rem; }
-        .badge { padding: 4px 8px; border-radius: 4px; font-weight: bold; font-size: 0.85rem; text-transform: uppercase; }
-        
-        /* Цветовая кодировка вердиктов */
-        .verdict-unknown { background: #e4e4e7; color: #52525b; }
-        .verdict-likely_accessible { background: #dcfce7; color: #166534; }
-        .verdict-unlikely_accessible { background: #fee2e2; color: #991b1b; }
-        .verdict-partially_accessible { background: #fef9c3; color: #854d0e; }
-        
-        .section { margin-top: 8px; font-size: 0.9rem; }
-        .section strong { display: block; color: #3f3f46; margin-bottom: 4px; }
-        ul { margin: 0; padding-left: 20px; color: #52525b; }
-        .search-box { margin-bottom: 20px; display: flex; gap: 10px; }
-        input, button { padding: 8px; border: 1px solid #ccc; border-radius: 4px; }
-        button { background: #2563eb; color: white; border: none; cursor: pointer; }
-        button:hover { background: #1d4ed8; }
+        * { box-sizing: border-box; }
+        :root {
+            font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            color: #17202a;
+            background: #f6f8f7;
+        }
+        body { margin: 0; min-height: 100vh; }
+        button, input, select { font: inherit; }
+        button { cursor: pointer; }
+
+        .app {
+            width: min(100%, 520px);
+            min-height: 100vh;
+            margin: 0 auto;
+            background: #f6f8f7;
+            padding-bottom: 40px;
+        }
+        .hero {
+            padding: 26px 20px 22px;
+            background: linear-gradient(145deg, #0f766e 0%, #115e59 100%);
+            color: white;
+            border-radius: 0 0 28px 28px;
+        }
+        .brand-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+        .brand { font-weight: 800; font-size: 1.4rem; letter-spacing: -0.03em; }
+        .beta { font-size: 0.72rem; border: 1px solid rgba(255,255,255,.45); border-radius: 999px; padding: 4px 8px; }
+        h1 { margin: 24px 0 8px; font-size: clamp(1.8rem, 8vw, 2.55rem); line-height: 1.04; letter-spacing: -0.045em; }
+        .lead { margin: 0; color: rgba(255,255,255,.83); line-height: 1.45; max-width: 410px; }
+
+        .search-panel {
+            margin: -1px 16px 0;
+            padding: 18px;
+            border-radius: 0 0 22px 22px;
+            background: white;
+            box-shadow: 0 14px 30px rgba(15, 23, 42, .08);
+        }
+        .field-label { display: block; font-size: .82rem; font-weight: 700; margin: 0 0 7px; color: #40504d; }
+        .field { width: 100%; border: 1px solid #dce4e1; border-radius: 14px; padding: 13px 14px; background: #fbfcfc; outline: none; }
+        .field:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.1); }
+        .row { display: grid; grid-template-columns: 1fr 120px; gap: 10px; margin-top: 12px; }
+        .actions { display: grid; grid-template-columns: 1fr; gap: 9px; margin-top: 14px; }
+        .primary, .secondary {
+            border: 0;
+            border-radius: 14px;
+            padding: 13px 15px;
+            font-weight: 750;
+        }
+        .primary { color: white; background: #0f766e; }
+        .primary:hover { background: #0d6b64; }
+        .secondary { color: #0f625c; background: #e7f4f1; }
+
+        main { padding: 22px 16px; }
+        .section-heading { display: flex; align-items: end; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+        .section-heading h2 { margin: 0; font-size: 1.15rem; }
+        .muted { color: #72807d; font-size: .82rem; }
+        .status { padding: 18px; border-radius: 18px; background: white; color: #596662; border: 1px solid #e4e9e7; line-height: 1.45; }
+        .status.error { color: #9f3030; background: #fff7f7; border-color: #f0d2d2; }
+
+        .cards { display: grid; gap: 12px; }
+        .card { background: white; border: 1px solid #e3e9e6; border-radius: 20px; padding: 16px; box-shadow: 0 6px 20px rgba(15, 23, 42, .045); }
+        .card-head { display: flex; gap: 12px; align-items: start; justify-content: space-between; }
+        .place-name { margin: 0; font-size: 1.05rem; line-height: 1.25; }
+        .category { margin-top: 4px; color: #7a8582; font-size: .8rem; }
+        .badge { flex: 0 0 auto; border-radius: 999px; padding: 6px 9px; font-size: .72rem; font-weight: 800; }
+        .likely_accessible { background: #def7e8; color: #17683d; }
+        .partially_accessible { background: #fff4c7; color: #805e00; }
+        .risky { background: #ffe8cf; color: #8c4c0a; }
+        .unlikely_accessible { background: #fde3e3; color: #922f2f; }
+        .unknown { background: #edf0ef; color: #66706d; }
+
+        .confidence { margin: 13px 0 0; font-size: .86rem; color: #4e5c58; }
+        .summary { margin-top: 13px; display: grid; gap: 8px; }
+        .fact { padding: 10px 11px; border-radius: 12px; background: #f7f9f8; font-size: .84rem; line-height: 1.35; }
+        .fact.good { background: #eff9f3; }
+        .fact.warn { background: #fff8ec; }
+        .fact.unknown-fact { background: #f2f4f4; color: #687471; }
+        details { margin-top: 12px; border-top: 1px solid #edf0ef; padding-top: 10px; }
+        summary { cursor: pointer; font-weight: 700; font-size: .84rem; color: #315c56; }
+        .evidence-list { margin: 10px 0 0; padding-left: 18px; color: #5f6966; font-size: .8rem; line-height: 1.5; }
+
+        @media (min-width: 700px) {
+            body { padding: 24px; }
+            .app { min-height: calc(100vh - 48px); border-radius: 28px; overflow: hidden; box-shadow: 0 20px 60px rgba(15,23,42,.13); }
+            .hero { border-radius: 0 0 28px 28px; }
+        }
     </style>
 </head>
 <body>
-    <div class="container">
-        <h2>🛠 Accessibility Finder - Debugger</h2>
-        <div class="search-box">
-            <input type="text" id="lat" value="55.7558" placeholder="Lat">
-            <input type="text" id="lon" value="37.6173" placeholder="Lon">
-            <input type="text" id="cat" value="pharmacy" placeholder="Category">
-            <input type="number" id="rad" value="1000" placeholder="Radius (m)">
-            <button onclick="fetchData()">Run Scoring Engine</button>
+<div class="app">
+    <header class="hero">
+        <div class="brand-row">
+            <div class="brand">AccessWay</div>
+            <div class="beta">MVP</div>
         </div>
-        <div id="results">Задайте параметры и нажмите Run...</div>
-    </div>
+        <h1>Проверьте доступность места до поездки</h1>
+        <p class="lead">AccessWay показывает не только итоговую оценку, но и почему она получена, насколько данным можно доверять и чего пока неизвестно.</p>
+    </header>
 
-    <script>
-        async function fetchData() {
-            const resultsDiv = document.getElementById('results');
-            resultsDiv.innerHTML = 'Загрузка данных из OSM и запуск скоринга...';
-            
-            const lat = document.getElementById('lat').value;
-            const lon = document.getElementById('lon').value;
-            const cat = document.getElementById('cat').value;
-            const rad = document.getElementById('rad').value;
-            const url = `http://127.0.0.1:8000/api/search?lat=${lat}&lon=${lon}&category=${cat}&radius=${rad}`;
+    <section class="search-panel">
+        <label class="field-label" for="address">Где искать</label>
+        <input class="field" id="address" value="Москва, Красная площадь" placeholder="Адрес или место">
 
-            try {
-                const response = await fetch(url);
-                if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
-                const data = await response.json();
-                
-                if (data.length === 0) {
-                    resultsDiv.innerHTML = 'Ничего не найдено в этом радиусе.';
-                    return;
-                }
+        <div class="row">
+            <div>
+                <label class="field-label" for="category">Что найти</label>
+                <select class="field" id="category">
+                    <option value="cafe">Кафе</option>
+                    <option value="restaurant">Ресторан</option>
+                    <option value="pharmacy">Аптека</option>
+                    <option value="museum">Музей</option>
+                    <option value="supermarket">Супермаркет</option>
+                    <option value="park">Парк</option>
+                    <option value="library">Библиотека</option>
+                    <option value="hospital">Больница</option>
+                </select>
+            </div>
+            <div>
+                <label class="field-label" for="radius">Радиус</label>
+                <select class="field" id="radius">
+                    <option value="500">500 м</option>
+                    <option value="700" selected>700 м</option>
+                    <option value="1000">1 км</option>
+                    <option value="1500">1.5 км</option>
+                </select>
+            </div>
+        </div>
 
-                resultsDiv.innerHTML = data.map(place => `
-                    <div class="card">
-                        <div class="header">
-                            <h3 class="title">${place.name} <span style="font-size: 0.8rem; color: #888;">(OSM: ${place.osm_id})</span></h3>
-                            <span class="badge verdict-${place.scoring.verdict}">
-                                ${place.scoring.verdict} (${place.scoring.confidence})
-                            </span>
-                        </div>
-                        <div class="section">
-                            <strong>Signals Checked: ${place.signals_extracted}</strong>
-                            <ul>
-                                ${place.signals.map(s => `<li>${s.key}: <b>${s.present ? s.value : 'missing'}</b> <span style="color:#a1a1aa; font-size:0.8rem;">(${s.source_detail})</span></li>`).join('')}
-                            </ul>
-                        </div>
-                        ${place.scoring.reasons.length > 0 ? `<div class="section"><strong>Reasons:</strong><ul>${place.scoring.reasons.map(r => `<li>✅ ${r}</li>`).join('')}</ul></div>` : ''}
-                        ${place.scoring.risks.length > 0 ? `<div class="section"><strong>Risks:</strong><ul>${place.scoring.risks.map(r => `<li>⚠️ ${r}</li>`).join('')}</ul></div>` : ''}
-                        ${place.scoring.unknowns.length > 0 ? `<div class="section"><strong>Unknowns:</strong><ul>${place.scoring.unknowns.map(u => `<li>❓ ${u}</li>`).join('')}</ul></div>` : ''}
-                    </div>
-                `).join('');
-            } catch (e) {
-                resultsDiv.innerHTML = `<div style="color:red;">Ошибка подключения к API: ${e.message}. Сервер запущен? CORS настроен?</div>`;
-            }
+        <div class="actions">
+            <button class="primary" id="searchButton">Найти подходящие места</button>
+            <button class="secondary" id="locationButton">Использовать моё местоположение</button>
+        </div>
+    </section>
+
+    <main>
+        <div class="section-heading">
+            <h2>Результаты</h2>
+            <span class="muted" id="resultMeta"></span>
+        </div>
+        <div id="results" class="status">Введите адрес или используйте геолокацию, чтобы начать.</div>
+    </main>
+</div>
+
+<script>
+    const API_BASE = window.ACCESSWAY_API_BASE || 'http://127.0.0.1:8000';
+
+    const resultsEl = document.getElementById('results');
+    const metaEl = document.getElementById('resultMeta');
+    const searchButton = document.getElementById('searchButton');
+    const locationButton = document.getElementById('locationButton');
+
+    const verdictLabels = {
+        likely_accessible: 'Вероятно доступно',
+        partially_accessible: 'Частично доступно',
+        risky: 'Нужно проверить',
+        unlikely_accessible: 'Есть препятствия',
+        unknown: 'Недостаточно данных'
+    };
+
+    const confidenceLabels = {
+        high: 'высокая',
+        medium: 'средняя',
+        low: 'низкая',
+        none: 'нет оценки'
+    };
+
+    function escapeHtml(value) {
+        return String(value ?? '')
+            .replaceAll('&', '&amp;')
+            .replaceAll('<', '&lt;')
+            .replaceAll('>', '&gt;')
+            .replaceAll('"', '&quot;')
+            .replaceAll("'", '&#039;');
+    }
+
+    function humanFact(key) {
+        return {
+            wheelchair_access: 'доступность для коляски',
+            entrance_step_free: 'вход без ступеней',
+            entrance_ramp: 'пандус',
+            kerb_type: 'бордюр',
+            step_count: 'ступени',
+            accessible_toilet: 'доступный туалет',
+            surface_type: 'покрытие',
+            door_automatic: 'автоматическая дверь',
+            elevator_present: 'лифт',
+            parking_accessible: 'доступная парковка',
+            barrier_present: 'барьеры'
+        }[key] || key.replaceAll('_', ' ');
+    }
+
+    function renderReports(reports, locationText = '') {
+        metaEl.textContent = reports.length ? `${reports.length} мест` : '';
+        if (!reports.length) {
+            resultsEl.className = 'status';
+            resultsEl.textContent = 'В выбранном радиусе ничего не найдено. Попробуйте увеличить радиус или выбрать другую категорию.';
+            return;
         }
-    </script>
+
+        resultsEl.className = 'cards';
+        resultsEl.innerHTML = reports.map(place => {
+            const reasons = (place.scoring.reasons || []).slice(0, 2);
+            const risks = (place.scoring.risks || []).slice(0, 2);
+            const unknowns = (place.scoring.unknowns || []).slice(0, 3);
+            const evidence = (place.evidence || []).filter(item => item.present);
+
+            return `
+                <article class="card">
+                    <div class="card-head">
+                        <div>
+                            <h3 class="place-name">${escapeHtml(place.name)}</h3>
+                            <div class="category">${escapeHtml(place.category)}${locationText ? ` · рядом с ${escapeHtml(locationText)}` : ''}</div>
+                        </div>
+                        <span class="badge ${escapeHtml(place.scoring.verdict)}">${escapeHtml(verdictLabels[place.scoring.verdict] || place.scoring.verdict)}</span>
+                    </div>
+                    <p class="confidence">Уверенность: <strong>${escapeHtml(confidenceLabels[place.scoring.confidence] || place.scoring.confidence)}</strong></p>
+
+                    <div class="summary">
+                        ${reasons.map(reason => `<div class="fact good">✓ ${escapeHtml(reason.text)}</div>`).join('')}
+                        ${risks.map(risk => `<div class="fact warn">⚠ ${escapeHtml(risk)}</div>`).join('')}
+                        ${unknowns.length ? `<div class="fact unknown-fact">? Неизвестно: ${unknowns.map(humanFact).map(escapeHtml).join(', ')}</div>` : ''}
+                    </div>
+
+                    <details>
+                        <summary>Почему такая оценка</summary>
+                        <ul class="evidence-list">
+                            ${evidence.length
+                                ? evidence.map(item => `<li><strong>${escapeHtml(humanFact(item.fact_key))}</strong>: ${escapeHtml(item.raw_value)} · ${escapeHtml(item.source_type)} · confidence ${escapeHtml(item.confidence)}</li>`).join('')
+                                : '<li>Подтверждённых признаков доступности в источнике пока нет.</li>'}
+                        </ul>
+                    </details>
+                </article>
+            `;
+        }).join('');
+    }
+
+    function showLoading(text) {
+        metaEl.textContent = '';
+        resultsEl.className = 'status';
+        resultsEl.textContent = text;
+    }
+
+    function showError(message) {
+        metaEl.textContent = '';
+        resultsEl.className = 'status error';
+        resultsEl.textContent = message;
+    }
+
+    async function requestJson(url) {
+        const response = await fetch(url);
+        let payload = null;
+        try { payload = await response.json(); } catch (_) {}
+        if (!response.ok) {
+            const detail = payload?.detail;
+            const message = typeof detail === 'string' ? detail : detail?.message;
+            throw new Error(message || `Ошибка API: ${response.status}`);
+        }
+        return payload;
+    }
+
+    async function searchByAddress() {
+        const address = document.getElementById('address').value.trim();
+        const category = document.getElementById('category').value;
+        const radius = document.getElementById('radius').value;
+        if (!address) return showError('Введите адрес или название места.');
+
+        showLoading('Ищем место и проверяем данные о доступности…');
+        try {
+            const params = new URLSearchParams({ query: address, category, radius_m: radius, limit: '20' });
+            const data = await requestJson(`${API_BASE}/api/v1/search/address?${params}`);
+            renderReports(data.results || [], data.location?.display_name || address);
+        } catch (error) {
+            showError(error.message || 'Не удалось выполнить поиск.');
+        }
+    }
+
+    async function searchNearby(lat, lon) {
+        const category = document.getElementById('category').value;
+        const radius = document.getElementById('radius').value;
+        showLoading('Определили местоположение. Проверяем места рядом…');
+
+        try {
+            const params = new URLSearchParams({ lat, lon, category, radius_m: radius, limit: '20' });
+            const data = await requestJson(`${API_BASE}/api/v1/search/nearby?${params}`);
+            renderReports(data, 'вас');
+        } catch (error) {
+            showError(error.message || 'Не удалось выполнить поиск рядом.');
+        }
+    }
+
+    searchButton.addEventListener('click', searchByAddress);
+    document.getElementById('address').addEventListener('keydown', event => {
+        if (event.key === 'Enter') searchByAddress();
+    });
+
+    locationButton.addEventListener('click', () => {
+        if (!navigator.geolocation) return showError('Этот браузер не поддерживает геолокацию.');
+        showLoading('Запрашиваем ваше местоположение…');
+        navigator.geolocation.getCurrentPosition(
+            pos => searchNearby(pos.coords.latitude, pos.coords.longitude),
+            () => showError('Не удалось получить геолокацию. Разрешите доступ к местоположению или используйте поиск по адресу.'),
+            { enableHighAccuracy: true, timeout: 10000, maximumAge: 60000 }
+        );
+    });
+</script>
 </body>
 </html>
