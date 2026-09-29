@@ -1,18 +1,19 @@
 """
-OSM data collector for AccessWay.
+External data collectors for AccessWay.
 
-Responsibility: fetch raw OSM elements from Overpass API.
-No business logic here — pure I/O.
+Responsibilities:
+- fetch raw POI elements from OpenStreetMap through Overpass;
+- geocode a human-readable address through Nominatim.
 
-Returns raw elements INCLUDING metadata (timestamp, version) so the
-scoring engine can calculate data freshness.
+No accessibility scoring or product decisions belong here. Collectors return
+raw/normalized source data and leave interpretation to the scoring engine.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
-from datetime import datetime, timezone
+import os
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import aiohttp
@@ -20,7 +21,12 @@ import aiohttp
 logger = logging.getLogger(__name__)
 
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=30)
+NOMINATIM_USER_AGENT = os.getenv(
+    "ACCESSWAY_USER_AGENT",
+    "AccessWay/0.1 (accessibility research MVP)",
+)
 
 # Maps internal category names to their OSM key=value pairs.
 # A category can have multiple OSM representations — all are fetched.
@@ -43,13 +49,7 @@ CATEGORY_TO_OSM: Dict[str, List[Dict[str, str]]] = {
 
 
 def _build_overpass_query(lat: float, lon: float, radius: int, category: str) -> str:
-    """
-    Build an Overpass QL query that:
-    - Returns nodes and ways within the radius
-    - Includes full OSM metadata (timestamp, version) via 'meta'
-    - Returns all tags
-    - Handles multiple OSM representations of one category
-    """
+    """Build an Overpass QL query for POIs around a coordinate."""
     osm_filters = CATEGORY_TO_OSM.get(category, [{"key": "amenity", "value": category}])
 
     element_blocks = []
@@ -62,13 +62,12 @@ def _build_overpass_query(lat: float, lon: float, radius: int, category: str) ->
         element_blocks.append(
             f'  way(around:{radius},{lat},{lon})["{key}"="{value}"];'
         )
+        element_blocks.append(
+            f'  relation(around:{radius},{lat},{lon})["{key}"="{value}"];'
+        )
 
     elements_str = "\n".join(element_blocks)
 
-    # 'out center meta tags' returns:
-    #   center — centroid for ways (lat/lon)
-    #   meta   — timestamp, version, changeset (needed for freshness)
-    #   tags   — all OSM tags
     return f"""[out:json][timeout:25];
 (
 {elements_str}
@@ -78,30 +77,73 @@ out center meta tags;
 
 
 def _parse_timestamp(ts: Optional[str]) -> Optional[datetime]:
-    """Parse OSM timestamp string (ISO 8601) to datetime."""
+    """Parse an OSM ISO-8601 timestamp."""
     if not ts:
         return None
     try:
-        # OSM timestamps look like "2023-11-14T10:22:05Z"
         return datetime.fromisoformat(ts.replace("Z", "+00:00"))
     except (ValueError, AttributeError):
         return None
 
 
 def _extract_centroid(element: Dict[str, Any]) -> Optional[Dict[str, float]]:
-    """Extract lat/lon from a node or way element."""
+    """Extract usable coordinates from a node, way, or relation."""
     if element.get("type") == "node":
         lat = element.get("lat")
         lon = element.get("lon")
         if lat is not None and lon is not None:
             return {"lat": lat, "lon": lon}
-    elif element.get("type") == "way":
+
+    if element.get("type") in ("way", "relation"):
         center = element.get("center", {})
         lat = center.get("lat")
         lon = center.get("lon")
         if lat is not None and lon is not None:
             return {"lat": lat, "lon": lon}
+
     return None
+
+
+async def geocode_address(query: str) -> Optional[Dict[str, Any]]:
+    """
+    Resolve a human-readable address/place name to one coordinate.
+
+    The function deliberately returns a tiny neutral contract so the API layer
+    does not depend on the raw Nominatim response shape.
+    """
+    params = {
+        "q": query,
+        "format": "jsonv2",
+        "limit": 1,
+        "addressdetails": 1,
+    }
+    headers = {
+        "User-Agent": NOMINATIM_USER_AGENT,
+        "Accept-Language": "ru,en;q=0.8",
+    }
+
+    async with aiohttp.ClientSession(timeout=REQUEST_TIMEOUT, headers=headers) as session:
+        async with session.get(NOMINATIM_URL, params=params) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+
+    if not data:
+        return None
+
+    first = data[0]
+    try:
+        lat = float(first["lat"])
+        lon = float(first["lon"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    return {
+        "lat": lat,
+        "lon": lon,
+        "display_name": first.get("display_name", query),
+        "osm_type": first.get("osm_type"),
+        "osm_id": first.get("osm_id"),
+    }
 
 
 async def fetch_raw_places(
@@ -110,17 +152,7 @@ async def fetch_raw_places(
     radius: int,
     category: str,
 ) -> List[Dict[str, Any]]:
-    """
-    Fetch raw OSM elements from Overpass for a given location and category.
-
-    Returns a list of normalized element dicts, each containing:
-        id:           OSM element ID
-        osm_type:     'node' or 'way'
-        lat, lon:     centroid coordinates
-        tags:         dict of all OSM tags
-        timestamp:    datetime of last OSM edit (or None)
-        name:         display name (from tags or fallback)
-    """
+    """Fetch and normalize raw OSM POIs around a coordinate."""
     query = _build_overpass_query(lat, lon, radius, category)
 
     async with aiohttp.ClientSession(timeout=REQUEST_TIMEOUT) as session:
@@ -134,15 +166,14 @@ async def fetch_raw_places(
     for element in elements:
         coords = _extract_centroid(element)
         if not coords:
-            # Skip elements we can't place on a map
             continue
 
         tags = element.get("tags", {})
         timestamp = _parse_timestamp(element.get("timestamp"))
 
         name = (
-            tags.get("name")
-            or tags.get("name:ru")
+            tags.get("name:ru")
+            or tags.get("name")
             or tags.get("name:en")
             or f"Unnamed {category}"
         )
@@ -153,7 +184,7 @@ async def fetch_raw_places(
             "lat": coords["lat"],
             "lon": coords["lon"],
             "tags": tags,
-            "timestamp": timestamp,  # OSM last-edit datetime
+            "timestamp": timestamp,
             "name": name,
             "category": category,
         })
@@ -162,11 +193,7 @@ async def fetch_raw_places(
 
 
 async def fetch_single_place(osm_type: str, osm_id: int) -> Optional[Dict[str, Any]]:
-    """
-    Fetch a single OSM element by ID and type.
-    Used by the /places/osm/{type}/{id} endpoint.
-    """
-    # Overpass query for a single element with full metadata
+    """Fetch one OSM element by ID and type."""
     type_char = {"node": "n", "way": "w", "relation": "r"}.get(osm_type, "n")
     query = f"""[out:json][timeout:15];
 {type_char}({osm_id});
@@ -190,13 +217,12 @@ out center meta tags;
     tags = element.get("tags", {})
     timestamp = _parse_timestamp(element.get("timestamp"))
     name = (
-        tags.get("name")
-        or tags.get("name:ru")
+        tags.get("name:ru")
+        or tags.get("name")
         or tags.get("name:en")
         or f"OSM {osm_type} {osm_id}"
     )
 
-    # Determine category from tags
     category = (
         tags.get("amenity")
         or tags.get("tourism")

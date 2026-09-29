@@ -1,76 +1,57 @@
 """
-AccessWay FastAPI application — MVP 0
+AccessWay FastAPI application — MVP 0.2.
 
-The core pipeline for every request:
-    1. collector.fetch_raw_places()  → raw OSM elements with metadata
-    2. engine.extract_evidence()     → Evidence list (sourced, timestamped)
-    3. engine.score()                → ScoringOutput (verdict + confidence + reasons)
-    4. PlaceReport assembled and returned
+Request pipeline:
+    collector -> Evidence extraction -> scoring -> PlaceReport -> product response
 
-No database is used in MVP 0 for the scoring pipeline.
-The DB layer (db_models, database) exists for the spatial search endpoint
-and will be the persistence layer in MVP 1.
+The HTTP layer orchestrates data collection and presentation only. Accessibility
+logic remains in app.engine so it stays deterministic and independently testable.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import os
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import List
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.collector import fetch_raw_places, fetch_single_place
+from app.collector import fetch_raw_places, fetch_single_place, geocode_address
 from app.engine import build_provenance, extract_evidence, score
-from app.models import PlaceReport
+from app.models import AddressSearchResponse, PlaceReport
 
-# ---------------------------------------------------------------------------
-# Configuration from environment (never hardcode credentials)
-# ---------------------------------------------------------------------------
-
-API_VERSION = "0.1.0"
+API_VERSION = "0.2.0"
 CITY = os.getenv("ACCESSWAY_CITY", "Moscow")
 DEBUG = os.getenv("ACCESSWAY_DEBUG", "false").lower() == "true"
 
 logging.basicConfig(level=logging.DEBUG if DEBUG else logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# App setup
-# ---------------------------------------------------------------------------
-
 app = FastAPI(
     title="AccessWay API",
     description=(
-        "AI-powered accessibility intelligence for urban places. "
-        "MVP 0: OSM data collection → signal extraction → confidence-scored place reports."
+        "Evidence-based accessibility intelligence for urban places. "
+        "The API explains what is known, what is uncertain, and how confident "
+        "the current accessibility assessment is."
     ),
     version=API_VERSION,
     docs_url="/docs",
     redoc_url="/redoc",
 )
 
-# CORS — required for debug.html (file://) and future web frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # Tighten to specific origins in production
+    allow_origins=[origin.strip() for origin in os.getenv("ACCESSWAY_CORS_ORIGINS", "*").split(",")],
     allow_credentials=False,
     allow_methods=["GET"],
     allow_headers=["*"],
 )
 
 
-# ---------------------------------------------------------------------------
-# Internal pipeline helper
-# ---------------------------------------------------------------------------
-
 def _build_report(raw: dict) -> PlaceReport:
-    """
-    Given a raw element dict from the collector, run the full engine pipeline
-    and return a PlaceReport.
-    """
     evidence = extract_evidence(
         tags=raw["tags"],
         osm_last_edit=raw.get("timestamp"),
@@ -92,13 +73,64 @@ def _build_report(raw: dict) -> PlaceReport:
     )
 
 
-# ---------------------------------------------------------------------------
-# Endpoints
-# ---------------------------------------------------------------------------
+def _distance_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Return great-circle distance in metres using the haversine formula."""
+    earth_radius_m = 6_371_000
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    d_phi = math.radians(lat2 - lat1)
+    d_lambda = math.radians(lon2 - lon1)
+
+    a = (
+        math.sin(d_phi / 2) ** 2
+        + math.cos(phi1) * math.cos(phi2) * math.sin(d_lambda / 2) ** 2
+    )
+    return 2 * earth_radius_m * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def _rank_reports(reports: List[PlaceReport], lat: float, lon: float) -> List[PlaceReport]:
+    """Rank by accessibility assessment, confidence, then distance."""
+    verdict_order = {
+        "likely_accessible": 0,
+        "partially_accessible": 1,
+        "risky": 2,
+        "unknown": 3,
+        "unlikely_accessible": 4,
+    }
+    confidence_order = {"high": 0, "medium": 1, "low": 2, "none": 3}
+
+    return sorted(
+        reports,
+        key=lambda report: (
+            verdict_order.get(report.scoring.verdict, 99),
+            confidence_order.get(report.scoring.confidence, 99),
+            _distance_m(lat, lon, report.lat, report.lon),
+        ),
+    )
+
+
+async def _search_reports(
+    lat: float,
+    lon: float,
+    radius_m: int,
+    category: str,
+    limit: int,
+) -> List[PlaceReport]:
+    try:
+        raw_places = await fetch_raw_places(lat, lon, radius_m, category)
+    except Exception as exc:
+        logger.exception("Overpass fetch failed")
+        raise HTTPException(
+            status_code=502,
+            detail="Не удалось загрузить данные о местах. Попробуйте ещё раз чуть позже.",
+        ) from exc
+
+    reports = [_build_report(raw) for raw in raw_places]
+    return _rank_reports(reports, lat, lon)[:limit]
+
 
 @app.get("/api/v1/health", tags=["system"])
 async def health():
-    """Service health check. Always returns 200 if the app is running."""
     return {
         "status": "ok",
         "version": API_VERSION,
@@ -111,90 +143,63 @@ async def health():
 async def search_nearby(
     lat: float = Query(..., description="Latitude", ge=-90, le=90),
     lon: float = Query(..., description="Longitude", ge=-180, le=180),
-    radius_m: int = Query(500, description="Search radius in metres", ge=50, le=2000),
+    radius_m: int = Query(500, description="Search radius in metres", ge=50, le=3000),
     category: str = Query("pharmacy", description="Place category"),
-    limit: int = Query(20, description="Maximum results to return", ge=1, le=50),
+    limit: int = Query(20, description="Maximum results", ge=1, le=50),
 ):
-    """
-    Find accessible places near a coordinate.
-
-    Returns places sorted by accessibility confidence (highest first),
-    with Unknown verdicts last. Each place includes full evidence list,
-    scoring, and data provenance.
-    """
-    try:
-        raw_places = await fetch_raw_places(lat, lon, radius_m, category)
-    except Exception as exc:
-        logger.error("Overpass fetch failed: %s", exc)
-        raise HTTPException(status_code=502, detail="Failed to fetch data from OpenStreetMap. Try again shortly.")
-
-    if not raw_places:
-        return []
-
-    reports = [_build_report(r) for r in raw_places[:limit]]
-
-    # Sort: known verdicts first (by confidence), unknown last
-    _verdict_order = {
-        "likely_accessible": 0,
-        "partially_accessible": 1,
-        "risky": 2,
-        "unlikely_accessible": 3,
-        "unknown": 4,
-    }
-    _confidence_order = {"high": 0, "medium": 1, "low": 2, "none": 3}
-
-    reports.sort(key=lambda r: (
-        _verdict_order.get(r.scoring.verdict, 99),
-        _confidence_order.get(r.scoring.confidence, 99),
-    ))
-
-    return reports
+    """Find nearby places and return explainable accessibility reports."""
+    return await _search_reports(lat, lon, radius_m, category, limit)
 
 
-@app.get("/api/v1/search/address", tags=["search"])
+@app.get(
+    "/api/v1/search/address",
+    response_model=AddressSearchResponse,
+    tags=["search"],
+)
 async def search_by_address(
-    query: str = Query(..., description="Address or place name to search near"),
-    radius_m: int = Query(500, description="Search radius in metres", ge=50, le=2000),
+    query: str = Query(..., min_length=2, description="Address or place name"),
+    radius_m: int = Query(700, description="Search radius in metres", ge=50, le=3000),
     category: str = Query("pharmacy", description="Place category"),
     limit: int = Query(20, ge=1, le=50),
 ):
-    """
-    Geocode an address and return nearby accessible places.
+    """Geocode an address/place name and search for accessible POIs around it."""
+    try:
+        location = await geocode_address(query)
+    except Exception as exc:
+        logger.exception("Nominatim geocoding failed")
+        raise HTTPException(
+            status_code=502,
+            detail="Поиск адреса временно недоступен. Попробуйте позже или используйте геолокацию.",
+        ) from exc
 
-    Note: Nominatim geocoding is not yet wired in MVP 0.
-    Returns a clear error message so the caller knows to use /search/nearby instead.
-    """
-    # TODO MVP 1: wire Nominatim geocoder here
-    raise HTTPException(
-        status_code=501,
-        detail={
-            "message": "Address search is not yet available in MVP 0. Use /search/nearby with lat/lon.",
-            "workaround": "/api/v1/search/nearby?lat=55.7558&lon=37.6173&category=pharmacy",
-        }
+    if location is None:
+        raise HTTPException(status_code=404, detail="Адрес или место не найдено.")
+
+    reports = await _search_reports(
+        location["lat"],
+        location["lon"],
+        radius_m,
+        category,
+        limit,
+    )
+
+    return AddressSearchResponse(
+        query=query,
+        location=location,
+        results=reports,
     )
 
 
 @app.get("/api/v1/places/osm/{osm_type}/{osm_id}", response_model=PlaceReport, tags=["places"])
-async def get_place_by_osm_id(
-    osm_type: str,
-    osm_id: int,
-):
-    """
-    Fetch and score a specific OSM element by its type and ID.
-
-    osm_type must be one of: node, way, relation
-    osm_id is the integer OSM element ID.
-
-    Example: /api/v1/places/osm/way/123456789
-    """
+async def get_place_by_osm_id(osm_type: str, osm_id: int):
     if osm_type not in ("node", "way", "relation"):
-        raise HTTPException(status_code=400, detail="osm_type must be 'node', 'way', or 'relation'")
+        raise HTTPException(status_code=400, detail="osm_type must be node, way, or relation")
 
     try:
         raw = await fetch_single_place(osm_type, osm_id)
     except Exception as exc:
-        logger.error("Overpass single-element fetch failed: %s", exc)
-        raise HTTPException(status_code=502, detail="Failed to fetch data from OpenStreetMap.")
+        logger.exception("Overpass single-element fetch failed")
+        raise HTTPException(status_code=502, detail="Не удалось загрузить данные OpenStreetMap.") from exc
 
     if raw is None:
         raise HTTPException(status_code=404, detail=f"OSM {osm_type}/{osm_id} not found.")
@@ -203,25 +208,15 @@ async def get_place_by_osm_id(
 
 
 @app.get("/api/v1/places/osm/{osm_type}/{osm_id}/evidence", tags=["debug"])
-async def get_place_evidence(
-    osm_type: str,
-    osm_id: int,
-):
-    """
-    Return the raw evidence list for a specific OSM element without scoring.
-
-    Useful for validating the signal extractor against known ground truth
-    during MVP 0 development. Shows exactly which OSM tags were found,
-    their interpreted values, and freshness.
-    """
+async def get_place_evidence(osm_type: str, osm_id: int):
     if osm_type not in ("node", "way", "relation"):
-        raise HTTPException(status_code=400, detail="osm_type must be 'node', 'way', or 'relation'")
+        raise HTTPException(status_code=400, detail="osm_type must be node, way, or relation")
 
     try:
         raw = await fetch_single_place(osm_type, osm_id)
     except Exception as exc:
-        logger.error("Overpass fetch failed: %s", exc)
-        raise HTTPException(status_code=502, detail="Failed to fetch data from OpenStreetMap.")
+        logger.exception("Overpass evidence fetch failed")
+        raise HTTPException(status_code=502, detail="Не удалось загрузить данные OpenStreetMap.") from exc
 
     if raw is None:
         raise HTTPException(status_code=404, detail=f"OSM {osm_type}/{osm_id} not found.")
@@ -238,5 +233,5 @@ async def get_place_evidence(
         "name": raw["name"],
         "raw_tags": raw["tags"],
         "timestamp": raw.get("timestamp"),
-        "evidence": [e.model_dump() for e in evidence],
+        "evidence": [item.model_dump() for item in evidence],
     }
