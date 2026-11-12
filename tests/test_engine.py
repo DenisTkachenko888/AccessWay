@@ -15,8 +15,9 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
 import pytest
+from itertools import permutations, product
 
-from app.engine import build_provenance, extract_evidence, score
+from app.engine import build_provenance, extract_evidence, score, _signal_confidence
 from app.models import Evidence
 
 
@@ -39,7 +40,7 @@ def test_step_count_is_preserved_regardless_of_entrance(entrance, count):
     if entrance is not None:
         tags["entrance"] = entrance
     evidence = extract_evidence(tags)
-    facts = {e.fact_key: e for e in evidence}
+    facts = {e.fact_key: e for e in reversed(evidence)}
     has_steps = int(count) > 0
     assert facts["step_count"].interpreted_value == ("yes" if has_steps else "no")
     assert facts["entrance_step_free"].interpreted_value == ("no" if has_steps else "yes")
@@ -47,7 +48,7 @@ def test_step_count_is_preserved_regardless_of_entrance(entrance, count):
     assert facts["entrance_step_free"].source_detail == f"OSM tag step_count={count}"
     result = score(evidence)
     assert result.verdict == ("risky" if has_steps else "likely_accessible")
-    assert all(r.fact_key != "step_count" for r in result.reasons)
+    assert any(r.fact_key == "step_count" for r in result.reasons)
 
 
 @pytest.mark.parametrize("count", ["", "yes", "no", "-1", "1.5", "unknown", "1;2"])
@@ -71,9 +72,11 @@ def test_barrier_does_not_increase_confidence(support, freshness):
     barrier = next(e for e in evidence if e.fact_key == "barrier_present")
     assert barrier.interpreted_value == "yes"
     result = score(evidence)
-    assert result.confidence == baseline.confidence
+    levels = {"none": 0, "low": 1, "medium": 2, "high": 3}
+    assert levels[result.confidence] <= levels[baseline.confidence]
+    assert result.verdict == "risky"
     assert result.decision_advice == baseline.decision_advice
-    assert all(r.fact_key != "barrier_present" for r in result.reasons)
+    assert any(r.fact_key == "barrier_present" for r in result.reasons)
 
 
 @pytest.mark.parametrize("value,verdict", [("yes", "risky"), ("no", "likely_accessible")])
@@ -116,6 +119,255 @@ def fresh_meta() -> datetime:
 
 def stale_meta() -> datetime:
     return datetime.now(timezone.utc) - timedelta(days=900)
+
+
+@pytest.mark.parametrize("key", ["wheelchair_access", "surface_type", "kerb_type",
+                                     "accessible_toilet", "custom_fact"])
+@pytest.mark.parametrize("present", [True, False])
+def test_all_uninterpreted_facts_are_unknown(key, present):
+    result = score([make_evidence(key, "unknown", present=present)])
+    assert result.unknowns == [key]
+    assert result.verdict == "unknown"
+    assert result.confidence == "none"
+    assert result.decision_advice == "do_not_rely"
+    assert result.reasons == []
+
+
+@pytest.mark.parametrize("value,verdict", [
+    ("yes", "likely_accessible"), ("no", "unlikely_accessible"),
+    ("limited", "partially_accessible"),
+])
+@pytest.mark.parametrize("age,confidence", [(0, "low"), (730, "low"),
+                                           (731, "low"), (2000, "low"), (None, "low")])
+def test_confidence_is_independent_of_age_for_all_wheelchair_values(value, verdict, age, confidence):
+    result = score([make_evidence("wheelchair_access", value, freshness_days=age)])
+    assert result.verdict == verdict
+    assert result.confidence == confidence
+    assert result.decision_advice == "verify_first"
+
+
+@pytest.mark.parametrize("quality", ["low", "none"])
+def test_weak_evidence_cannot_be_promoted_by_freshness(quality):
+    result = score([make_evidence("wheelchair_access", "yes", confidence=quality)])
+    assert result.confidence == "low"
+    assert result.decision_advice == "verify_first"
+
+
+def test_repeated_collection_and_supporters_do_not_inflate_confidence():
+    wc = make_evidence("wheelchair_access", "yes", confidence="high")
+    baseline = score([wc])
+    repeat = wc.model_copy(update={"collected_at": wc.collected_at + timedelta(days=1)})
+    assert score([wc, repeat]) == baseline
+    enriched = score([wc, make_evidence("entrance_ramp", "yes"),
+                      make_evidence("accessible_toilet", "yes")])
+    assert enriched.confidence == baseline.confidence == "low"
+    assert enriched.decision_advice == "verify_first"
+
+
+@pytest.mark.parametrize("key", ["wheelchair_access", "entrance_step_free", "accessible_toilet"])
+def test_conflicts_are_explicit_and_permutation_invariant(key):
+    items = [make_evidence(key, "yes"), make_evidence(key, "no"),
+             make_evidence("wheelchair_access", "limited")]
+    expected = score(items)
+    assert expected.verdict == "risky"
+    assert expected.confidence == "low"
+    assert expected.decision_advice == "verify_first"
+    assert key in expected.unknowns
+    assert any("reports" in risk for risk in expected.risks)
+    assert {"yes", "no"} <= {
+        value for value in ("yes", "no")
+        if any(f"{key}={value}" in reason.text for reason in expected.reasons)
+    }
+    for order in permutations(items):
+        assert score(list(order)) == expected
+
+
+def test_agreeing_evidence_uses_weakest_age_independent_of_order():
+    items = [make_evidence("wheelchair_access", "yes", freshness_days=10),
+             make_evidence("wheelchair_access", "yes", freshness_days=900),
+             make_evidence("wheelchair_access", "unknown", present=False)]
+    expected = score(items)
+    assert expected.confidence == "low"
+    assert "wheelchair_access" in expected.unknowns
+    for order in permutations(items):
+        assert score(list(order)) == expected
+
+
+@pytest.mark.parametrize("step,age,expected", [("yes", 0, "low"),
+    ("yes", 900, "low"), ("no", 0, "low"), ("unknown", 0, "low")])
+def test_required_step_free_uses_value_and_strength(step, age, expected):
+    result = score([make_evidence("wheelchair_access", "yes"),
+                    make_evidence("entrance_step_free", step, freshness_days=age)],
+                   user_needs={"step_free_required": True})
+    assert result.confidence == expected
+    assert result.decision_advice == "verify_first"
+    if step != "yes":
+        assert any("Step-free entrance is not confirmed" in risk for risk in result.risks)
+
+
+def test_reasons_attribute_non_osm_source_without_claiming_verification():
+    item = make_evidence("wheelchair_access", "no").model_copy(update={
+        "source_type": "official", "source_id": "museum-123"
+    })
+    reason = score([item]).reasons[0]
+    assert reason.source_type == "official"
+    assert "museum-123" in reason.text
+    assert "not independent verification" in reason.text
+    assert "OpenStreetMap" not in reason.text
+
+
+def test_fresh_osm_edit_does_not_create_high_confidence():
+    evidence = extract_evidence({"wheelchair": "yes"}, osm_last_edit=fresh_meta())
+    wc = next(e for e in evidence if e.fact_key == "wheelchair_access")
+    assert wc.confidence == "low"
+    result = score(evidence)
+    assert result.confidence == "low"
+    assert any("not confirmation" in risk for risk in result.risks)
+
+
+@pytest.mark.parametrize("age", [-1, None, 0, 730, 731])
+def test_extraction_and_score_do_not_promote_unverified_claims(age):
+    confidence = _signal_confidence("yes")
+    item = make_evidence("wheelchair_access", "yes", confidence=confidence,
+                         freshness_days=age)
+    assert score([item]).confidence == confidence
+
+
+@pytest.mark.parametrize("future_offset", [timedelta(seconds=1), timedelta(days=10)])
+def test_future_source_date_is_unknown_not_fresh(future_offset):
+    collected = datetime(2026, 11, 12, tzinfo=timezone.utc)
+    items = extract_evidence({"wheelchair": "yes"},
+                             collected + future_offset, collected_at=collected)
+    assert all(e.freshness_days is None for e in items)
+    assert score(items).confidence == "low"
+    assert build_provenance(items).freshness_label == "unknown"
+
+
+@pytest.mark.parametrize("naive_source,naive_collection", [(True, False), (False, True), (True, True)])
+def test_legacy_naive_dates_are_consistently_utc(naive_source, naive_collection):
+    collected = datetime(2026, 11, 12, tzinfo=timezone.utc)
+    source = collected - timedelta(days=5)
+    items = extract_evidence(
+        {"wheelchair": "yes"},
+        source.replace(tzinfo=None) if naive_source else source,
+        collected_at=collected.replace(tzinfo=None) if naive_collection else collected,
+    )
+    assert items[0].freshness_days == 5
+    assert items[0].collected_at == collected
+    assert items[0].observed_at == source
+
+
+@pytest.mark.parametrize("value", ["yes", "no"])
+@pytest.mark.parametrize("wheelchair", [None, "yes", "no", "limited"])
+def test_cross_fact_step_disagreement_is_not_silently_accepted(value, wheelchair):
+    items = [make_evidence("entrance_step_free", value),
+             make_evidence("step_count", value)]
+    if wheelchair:
+        items.append(make_evidence("wheelchair_access", wheelchair))
+    expected = score(items, user_needs={"step_free_required": True})
+    assert expected.verdict == "risky"
+    assert expected.confidence == "low"
+    assert expected.decision_advice == "verify_first"
+    assert "entrance_step_free" in expected.unknowns
+    assert "step_count" not in expected.unknowns
+    assert any("different entrances" in risk for risk in expected.risks)
+    for order in permutations(items):
+        assert score(list(order), user_needs={"step_free_required": True}) == expected
+
+
+@pytest.mark.parametrize("ages,expected", [([1, 900], "stale"), ([1, None], "unknown"),
+                                          ([1, -1], "unknown")])
+def test_provenance_age_is_order_independent_and_does_not_refresh_collection(ages, expected):
+    collected = datetime(2020, 1, 1, tzinfo=timezone.utc)
+    items = [make_evidence("wheelchair_access", "yes", freshness_days=age)
+             .model_copy(update={"collected_at": collected}) for age in ages]
+    for order in permutations(items):
+        provenance = build_provenance(list(order))
+        assert provenance.collected_at == collected
+        assert provenance.freshness_label == expected
+
+
+def test_advice_invariants_across_wheelchair_steps_age_and_user_need():
+    # Check policy properties across 384 combinations rather than duplicating
+    # branch implementation in the expected result.
+    for wheelchair, step, age, required, quality in product(
+        ("yes", "no", "limited", "unknown"), ("yes", "no", "unknown"),
+        (0, 730, 731, None), (False, True), ("medium", "low", "none", "high"),
+    ):
+        items = [make_evidence("wheelchair_access", wheelchair, confidence=quality,
+                               freshness_days=age),
+                 make_evidence("entrance_step_free", step, confidence=quality,
+                               freshness_days=age)]
+        result = score(items, user_needs={"step_free_required": required})
+        assert result.confidence != "high"
+        assert result.decision_advice != "good_option"
+        assert result.decision_advice != "choose_alternative"
+        if result.confidence == "none":
+            assert result.decision_advice == "do_not_rely"
+        if required and step != "yes":
+            assert result.confidence in {"low", "none"}
+            assert any("Step-free entrance is not confirmed" in risk for risk in result.risks)
+        assert score(list(reversed(items)),
+                     user_needs={"step_free_required": required}) == result
+
+
+@pytest.mark.parametrize("source", ["osm", "official", "user_confirmation", "visual_analysis", "derived"])
+@pytest.mark.parametrize("claimed_confidence", ["none", "low", "medium", "high"])
+def test_source_label_and_claimed_confidence_are_not_verification(source, claimed_confidence):
+    item = make_evidence("wheelchair_access", "yes", confidence=claimed_confidence)
+    item = item.model_copy(update={"source_type": source})
+    result = score([item])
+    assert result.confidence == "low"
+    assert result.decision_advice == "verify_first"
+    assert result.reasons[0].source_type == source
+
+
+def test_unscoped_entrances_preserve_claims_without_asserting_contradiction():
+    items = extract_evidence({"wheelchair": "yes", "entrance": "level", "step_count": "3"})
+    entrance_items = [e for e in items if e.fact_key == "entrance_step_free"]
+    assert {(e.source_detail, e.interpreted_value) for e in entrance_items} == {
+        ("OSM tag entrance=level", "yes"), ("OSM tag step_count=3", "no")
+    }
+    result = score(items, user_needs={"step_free_required": True})
+    assert result.verdict == "risky"
+    assert result.confidence == "low"
+    assert result.decision_advice == "verify_first"
+    assert "entrance_step_free" in result.unknowns
+    assert any("different entrances" in risk for risk in result.risks)
+    assert any("not a confirmed contradiction" in risk for risk in result.risks)
+    assert any("entrance_step_free=yes" in r.text for r in result.reasons)
+    assert any("step_count=yes" in r.text for r in result.reasons)
+    assert score(list(reversed(items)), user_needs={"step_free_required": True}) == result
+
+
+def test_missing_required_fact_is_listed_even_with_sparse_evidence():
+    result = score([make_evidence("wheelchair_access", "yes")],
+                   user_needs={"step_free_required": True})
+    assert "entrance_step_free" in result.unknowns
+    assert result.decision_advice == "verify_first"
+
+
+def test_source_fidelity_is_preserved_without_promoting_accessibility_confidence():
+    collected = datetime(2026, 11, 12, tzinfo=timezone.utc)
+    items = extract_evidence({"wheelchair": "yes"}, collected,
+                             source_id="node/123", collected_at=collected)
+    wc = next(e for e in items if e.fact_key == "wheelchair_access")
+    assert wc.raw_value == "yes"
+    assert wc.source_detail == "OSM tag wheelchair=yes"
+    assert wc.source_id == "node/123"
+    assert wc.freshness_days == 0
+    assert wc.confidence == score(items).confidence == "low"
+
+
+def test_source_age_warning_is_separate_from_confidence():
+    recent = make_evidence("wheelchair_access", "yes", freshness_days=730)
+    old = recent.model_copy(update={"freshness_days": 731})
+    recent_result, old_result = score([recent]), score([old])
+    assert recent_result.confidence == old_result.confidence == "low"
+    assert recent_result.verdict == old_result.verdict
+    assert recent_result.decision_advice == old_result.decision_advice
+    assert not any("two years" in risk for risk in recent_result.risks)
+    assert any("two years" in risk for risk in old_result.risks)
 
 
 # ---------------------------------------------------------------------------
@@ -192,7 +444,7 @@ class TestExtractEvidence:
         assert wc.freshness_days is not None
         assert 44 <= wc.freshness_days <= 46
 
-    def test_stale_data_degrades_to_low_confidence(self):
+    def test_stale_osm_data_remains_low_confidence(self):
         osm_date = datetime.now(timezone.utc) - timedelta(days=800)
         evidence = extract_evidence({"wheelchair": "yes"}, osm_last_edit=osm_date)
         wc = next(e for e in evidence if e.fact_key == "wheelchair_access")
@@ -220,13 +472,13 @@ class TestScore:
         assert result.confidence == "none"
         assert result.decision_advice == "do_not_rely"
 
-    def test_wheelchair_yes_alone_medium_confidence(self):
+    def test_wheelchair_yes_alone_low_confidence(self):
         evidence = [make_evidence("wheelchair_access", "yes")]
         result = score(evidence)
         assert result.verdict == "likely_accessible"
-        assert result.confidence in ("medium", "low")  # no supporting signals
+        assert result.confidence == "low"
 
-    def test_wheelchair_yes_with_two_supporters_high_confidence(self):
+    def test_wheelchair_yes_with_two_supporters_stays_low(self):
         evidence = [
             make_evidence("wheelchair_access", "yes"),
             make_evidence("entrance_step_free", "yes"),
@@ -234,32 +486,32 @@ class TestScore:
         ]
         result = score(evidence)
         assert result.verdict == "likely_accessible"
-        assert result.confidence == "high"
-        assert result.decision_advice == "good_option"
+        assert result.confidence == "low"
+        assert result.decision_advice == "verify_first"
 
-    def test_wheelchair_no_returns_unlikely_high(self):
+    def test_wheelchair_no_returns_unlikely_low(self):
         evidence = [make_evidence("wheelchair_access", "no")]
         result = score(evidence)
         assert result.verdict == "unlikely_accessible"
-        assert result.confidence == "high"
-        assert result.decision_advice == "choose_alternative"
+        assert result.confidence == "low"
+        assert result.decision_advice == "verify_first"
 
     def test_wheelchair_limited_returns_partially_accessible(self):
         evidence = [make_evidence("wheelchair_access", "limited")]
         result = score(evidence)
         assert result.verdict == "partially_accessible"
-        assert result.confidence == "medium"
+        assert result.confidence == "low"
 
-    def test_risky_verdict_on_contradiction(self):
+    def test_risky_verdict_on_unscoped_barrier_report(self):
         """wheelchair=yes + step recorded = risky, not likely_accessible."""
         evidence = [
             make_evidence("wheelchair_access", "yes"),
-            make_evidence("entrance_step_free", "no"),   # steps confirmed
+            make_evidence("entrance_step_free", "no"),   # source reports a barrier
         ]
         result = score(evidence)
         assert result.verdict == "risky"
         assert result.confidence == "low"
-        assert "contradictory" in result.risks[0].lower()
+        assert any("verify" in risk.lower() for risk in result.risks)
 
     def test_unknowns_list_populated(self):
         """Absent fact_keys must appear in the unknowns list."""
@@ -320,20 +572,21 @@ class TestAdversarial:
         result = score(evidence)
         assert result.verdict == "likely_accessible"
 
-    def test_full_pipeline_wheelchair_yes_stale_degrades(self):
-        """Stale wheelchair=yes should have lower confidence than fresh."""
+    def test_full_pipeline_age_changes_freshness_not_confidence(self):
+        """Age is source metadata, not a basis for physical verification."""
         fresh_ev = extract_evidence({"wheelchair": "yes"}, osm_last_edit=fresh_meta())
         stale_ev = extract_evidence({"wheelchair": "yes"}, osm_last_edit=stale_meta())
         fresh_result = score(fresh_ev)
         stale_result = score(stale_ev)
-        confidence_order = {"high": 0, "medium": 1, "low": 2, "none": 3}
-        assert confidence_order[stale_result.confidence] >= confidence_order[fresh_result.confidence]
+        assert fresh_result.confidence == stale_result.confidence == "low"
+        assert build_provenance(fresh_ev).freshness_label == "fresh"
+        assert build_provenance(stale_ev).freshness_label == "stale"
 
-    def test_full_pipeline_contradiction(self):
-        """OSM marked accessible but steps confirmed — should surface as risky."""
+    def test_full_pipeline_unscoped_steps_risk(self):
+        """Reported steps require checking which entrance is usable."""
         evidence = extract_evidence({
             "wheelchair": "yes",
-            "step_count": "2",   # contradicts wheelchair=yes
+            "step_count": "2",   # may refer to another entrance
         })
         result = score(evidence)
         assert result.verdict == "risky"
