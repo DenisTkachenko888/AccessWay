@@ -20,6 +20,71 @@ from app.engine import build_provenance, extract_evidence, score
 from app.models import Evidence
 
 
+@pytest.mark.parametrize("entrance", ["yes", "no", "main", "secondary", "0", "1"])
+def test_entrance_type_does_not_confirm_step_free_access(entrance):
+    evidence = extract_evidence({"wheelchair": "yes", "entrance": entrance})
+    item = next(e for e in evidence if e.fact_key == "entrance_step_free")
+    assert item.present
+    assert item.interpreted_value == "unknown"
+    result = score(evidence, user_needs={"step_free_required": True})
+    assert "entrance_step_free" in result.unknowns
+    assert any("Step-free entrance is not confirmed" in risk for risk in result.risks)
+    assert all(r.fact_key != "entrance_step_free" for r in result.reasons)
+
+
+@pytest.mark.parametrize("entrance", [None, "yes", "main", "level"])
+@pytest.mark.parametrize("count", ["0", "1", "3", " 12 "])
+def test_step_count_is_preserved_regardless_of_entrance(entrance, count):
+    tags = {"wheelchair": "yes", "step_count": count}
+    if entrance is not None:
+        tags["entrance"] = entrance
+    evidence = extract_evidence(tags)
+    facts = {e.fact_key: e for e in evidence}
+    has_steps = int(count) > 0
+    assert facts["step_count"].interpreted_value == ("yes" if has_steps else "no")
+    assert facts["entrance_step_free"].interpreted_value == ("no" if has_steps else "yes")
+    assert facts["step_count"].raw_value == count
+    assert facts["entrance_step_free"].source_detail == f"OSM tag step_count={count}"
+    result = score(evidence)
+    assert result.verdict == ("risky" if has_steps else "likely_accessible")
+    assert all(r.fact_key != "step_count" for r in result.reasons)
+
+
+@pytest.mark.parametrize("count", ["", "yes", "no", "-1", "1.5", "unknown", "1;2"])
+def test_invalid_step_counts_remain_unknown(count):
+    evidence = extract_evidence({"step_count": count, "entrance": "yes"})
+    result = score(evidence)
+    for key in ("step_count", "entrance_step_free"):
+        item = next(e for e in evidence if e.fact_key == key)
+        assert item.interpreted_value == "unknown"
+        assert key in result.unknowns
+    assert result.verdict == "unknown"
+
+
+@pytest.mark.parametrize("support", [{}, {"entrance": "level"}])
+@pytest.mark.parametrize("freshness", [None, datetime(2026, 1, 1, tzinfo=timezone.utc)])
+def test_barrier_does_not_increase_confidence(support, freshness):
+    tags = {"wheelchair": "yes", **support}
+    collected = datetime(2026, 2, 1, tzinfo=timezone.utc)
+    baseline = score(extract_evidence(tags, freshness, collected_at=collected))
+    evidence = extract_evidence({**tags, "barrier": "yes"}, freshness, collected_at=collected)
+    barrier = next(e for e in evidence if e.fact_key == "barrier_present")
+    assert barrier.interpreted_value == "yes"
+    result = score(evidence)
+    assert result.confidence == baseline.confidence
+    assert result.decision_advice == baseline.decision_advice
+    assert all(r.fact_key != "barrier_present" for r in result.reasons)
+
+
+@pytest.mark.parametrize("value,verdict", [("yes", "risky"), ("no", "likely_accessible")])
+def test_scoring_step_presence_without_derived_step_free(value, verdict):
+    result = score([
+        make_evidence("wheelchair_access", "yes"),
+        make_evidence("step_count", value),
+    ])
+    assert result.verdict == verdict
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

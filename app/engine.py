@@ -42,7 +42,7 @@ _OSM_TAG_MAP: Dict[str, List[str]] = {
     "wheelchair_access": ["wheelchair"],
     # entrance=level means step-free. step_count=0 also implies it.
     # Note: "entrance:step_free" is NOT a standard OSM tag.
-    "entrance_step_free": ["entrance", "step_count"],
+    "entrance_step_free": ["step_count", "entrance"],
     # ramp:wheelchair=yes is the specific tag; ramp=yes alone is ambiguous
     "entrance_ramp": ["ramp:wheelchair", "ramp"],
     "kerb_type": ["kerb"],
@@ -74,25 +74,31 @@ def _classify_freshness(days: Optional[int]) -> str:
     return "very_stale"
 
 
-def _interpret_osm_value(fact_key: str, raw: Optional[str]) -> str:
+def _interpret_osm_value(fact_key: str, raw: Optional[str], tag_key: Optional[str] = None) -> str:
     """Normalize a raw OSM tag value to yes/no/limited/unknown."""
     if raw is None:
         return "unknown"
     raw = raw.strip().lower()
 
-    # Special case: entrance=level means step-free entrance
-    if fact_key == "entrance_step_free" and raw == "level":
-        return "yes"
-    # step_count=0 means step-free
-    if fact_key == "entrance_step_free" and raw == "0":
-        return "yes"
-    # Any step_count > 0 means NOT step-free
-    if fact_key == "entrance_step_free":
-        try:
-            if int(raw) > 0:
-                return "no"
-        except (ValueError, TypeError):
-            pass
+    if fact_key in {"entrance_step_free", "step_count"}:
+        if tag_key == "step_count":
+            # Keep the count in raw_value; the existing binary contract describes
+            # presence of steps, not accessibility. Reject non-integer counts.
+            if not raw or any(char not in "0123456789" for char in raw):
+                return "unknown"
+            has_steps = any(char != "0" for char in raw)
+            if fact_key == "step_count":
+                return "yes" if has_steps else "no"
+            return "no" if has_steps else "yes"
+        if tag_key == "entrance":
+            # Retain the existing explicit level interpretation. Other entrance
+            # types (including yes/no) say nothing about the number of steps.
+            return "yes" if raw == "level" else "unknown"
+        return "unknown"
+
+    if fact_key == "barrier_present":
+        # Barrier presence is not a positive accessibility signal.
+        return raw if raw in {"yes", "no"} else "unknown"
 
     if raw in _POSITIVE_VALUES:
         return "yes"
@@ -168,7 +174,7 @@ def extract_evidence(
                 break
 
         present = raw_value is not None
-        interpreted = _interpret_osm_value(fact_key, raw_value) if present else "unknown"
+        interpreted = _interpret_osm_value(fact_key, raw_value, matched_tag) if present else "unknown"
         confidence = _signal_confidence(interpreted, freshness_days) if present else "none"
 
         source_detail = (
@@ -239,7 +245,13 @@ def score(
     by_key = {e.fact_key: e for e in evidence}
 
     present = [e for e in evidence if e.present]
-    absent_keys = [e.fact_key for e in evidence if not e.present]
+    absent_keys = [
+        e.fact_key for e in evidence
+        if not e.present or (
+            e.fact_key in {"entrance_step_free", "step_count", "barrier_present"}
+            and e.interpreted_value == "unknown"
+        )
+    ]
 
     # --- Rule 1: no data at all ---
     if not present:
@@ -279,7 +291,7 @@ def score(
     if wc and wc.present and wc.interpreted_value == "yes":
         has_step_contradiction = (
             (step_free and step_free.present and step_free.interpreted_value == "no")
-            or (step_count_ev and step_count_ev.present and step_count_ev.interpreted_value == "no")
+            or (step_count_ev and step_count_ev.present and step_count_ev.interpreted_value == "yes")
         )
         if has_step_contradiction:
             return ScoringOutput(
@@ -311,7 +323,8 @@ def score(
         # Count supporting positive evidence
         supporting = [
             e for e in present
-            if e.fact_key != "wheelchair_access" and e.interpreted_value in ("yes",)
+            if e.fact_key not in {"wheelchair_access", "step_count", "barrier_present"}
+            and e.interpreted_value == "yes"
         ]
         for s in supporting:
             reasons.append(Reason(
@@ -344,7 +357,9 @@ def score(
             decision_advice = "verify_first"
 
         # User needs override
-        if user_needs.get("step_free_required") and not (step_free and step_free.present):
+        if user_needs.get("step_free_required") and not (
+            step_free and step_free.present and step_free.interpreted_value == "yes"
+        ):
             if confidence == "high":
                 confidence = "medium"
             risks.append("Step-free entrance is not confirmed. Verify before visiting.")
