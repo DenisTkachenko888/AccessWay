@@ -79,7 +79,6 @@
         .confidence { margin: 13px 0 0; font-size: .86rem; color: #4e5c58; }
         .summary { margin-top: 13px; display: grid; gap: 8px; }
         .fact { padding: 10px 11px; border-radius: 12px; background: #f7f9f8; font-size: .84rem; line-height: 1.35; }
-        .fact.good { background: #eff9f3; }
         .fact.warn { background: #fff8ec; }
         .fact.unknown-fact { background: #f2f4f4; color: #687471; }
         details { margin-top: 12px; border-top: 1px solid #edf0ef; padding-top: 10px; }
@@ -206,9 +205,10 @@
 
         resultsEl.className = 'cards';
         resultsEl.innerHTML = reports.map(place => {
-            const reasons = (place.scoring.reasons || []).slice(0, 2);
-            const risks = (place.scoring.risks || []).slice(0, 2);
-            const unknowns = (place.scoring.unknowns || []).slice(0, 3);
+            // Reasons are source claims, not necessarily accessibility benefits.
+            const reasons = place.scoring.reasons || [];
+            const risks = place.scoring.risks || [];
+            const unknowns = place.scoring.unknowns || [];
             const evidence = (place.evidence || []).filter(item => item.present);
 
             return `
@@ -223,7 +223,7 @@
                     <p class="confidence">Уверенность: <strong>${escapeHtml(confidenceLabels[place.scoring.confidence] || place.scoring.confidence)}</strong></p>
 
                     <div class="summary">
-                        ${reasons.map(reason => `<div class="fact good">✓ ${escapeHtml(reason.text)}</div>`).join('')}
+                        ${reasons.map(reason => `<div class="fact">Источник сообщает: ${escapeHtml(reason.text)}</div>`).join('')}
                         ${risks.map(risk => `<div class="fact warn">⚠ ${escapeHtml(risk)}</div>`).join('')}
                         ${unknowns.length ? `<div class="fact unknown-fact">? Неизвестно: ${unknowns.map(humanFact).map(escapeHtml).join(', ')}</div>` : ''}
                     </div>
