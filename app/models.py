@@ -57,7 +57,7 @@ class Evidence(BaseModel):
     )
     confidence: str = Field(
         pattern="^(high|medium|low|none)$",
-        description="Confidence in this evidence item. 'none' = tag absent entirely",
+        description="Support for the physical claim, not accuracy of copying its raw tag. Unverified OSM claims are low; absent or uninterpreted data is none",
     )
     collected_at: datetime = Field(
         default_factory=utc_now,
@@ -65,7 +65,7 @@ class Evidence(BaseModel):
     )
     observed_at: Optional[datetime] = Field(
         default=None,
-        description="When the source claims this was true (OSM last-edit date, etc.)",
+        description="Source timestamp; the OSM adapter supplies last-edit time, not an accessibility inspection date",
     )
     freshness_days: Optional[int] = Field(
         default=None,
@@ -113,7 +113,10 @@ class ScoringOutput(BaseModel):
     verdict: str = Field(
         pattern="^(likely_accessible|partially_accessible|risky|unlikely_accessible|unknown)$"
     )
-    confidence: str = Field(pattern="^(high|medium|low|none)$")
+    confidence: str = Field(
+        pattern="^(high|medium|low|none)$",
+        description="Qualitative support for the assessment, not a probability or verification certificate",
+    )
     decision_advice: str = Field(
         pattern="^(good_option|verify_first|choose_alternative|do_not_rely)$",
         description="Actionable advice for the user",
@@ -121,9 +124,11 @@ class ScoringOutput(BaseModel):
     reasons: List[Reason]
     risks: List[str]
     unknowns: List[str] = Field(
-        description="fact_keys that were checked but found absent — shown explicitly to user"
+        description="Checked fact_keys with missing, uninterpreted or conflicting data"
     )
-    evidence_count: int = Field(description="Total evidence items that informed this verdict")
+    evidence_count: int = Field(
+        description="Distinct present source claims; not a count of independent confirmations"
+    )
 
 
 # ---------------------------------------------------------------------------

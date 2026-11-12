@@ -56,7 +56,7 @@ _OSM_TAG_MAP: Dict[str, List[str]] = {
     "barrier_present": ["barrier"],
 }
 
-# Freshness thresholds in days
+# Display-only age bands, not thresholds for confidence or verification.
 _FRESHNESS_THRESHOLDS = [
     (180, "fresh"),
     (365, "recent"),
@@ -65,8 +65,13 @@ _FRESHNESS_THRESHOLDS = [
 ]
 
 
+def _as_utc(value: datetime) -> datetime:
+    """Treat legacy naive timestamps as UTC, never as machine-local time."""
+    return (value if value.tzinfo else value.replace(tzinfo=timezone.utc)).astimezone(timezone.utc)
+
+
 def _classify_freshness(days: Optional[int]) -> str:
-    if days is None:
+    if days is None or days < 0:
         return "unknown"
     for threshold, label in _FRESHNESS_THRESHOLDS:
         if days <= threshold:
@@ -109,27 +114,19 @@ def _interpret_osm_value(fact_key: str, raw: Optional[str], tag_key: Optional[st
     return "unknown"
 
 
-def _signal_confidence(interpreted: str, freshness_days: Optional[int]) -> str:
+def _signal_confidence(interpreted: str) -> str:
     """
     Determine confidence for a single evidence item.
     Rules:
     - If tag is absent: none
-    - If interpreted value is unknown (tag present but unrecognized): low
-    - Then apply freshness penalty
+    - Uninterpreted values have no usable confidence.
+    - An interpreted OSM claim is unverified: low regardless of source age.
+    This describes support for the physical fact, not fidelity of tag copying.
     """
     if interpreted == "unknown":
         return "none"
 
-    freshness = _classify_freshness(freshness_days)
-
-    if freshness in ("fresh", "recent"):
-        return "high" if interpreted in ("yes", "no") else "medium"
-    if freshness == "aging":
-        return "medium" if interpreted in ("yes", "no") else "low"
-    if freshness in ("stale", "very_stale"):
-        return "low"
-    # freshness unknown
-    return "medium" if interpreted in ("yes", "no") else "low"
+    return "low"
 
 
 def extract_evidence(
@@ -141,7 +138,9 @@ def extract_evidence(
     """
     Extract Evidence from raw OSM tags.
 
-    Always returns one Evidence item per fact_key — even for absent tags.
+    Returns Evidence for every checked fact_key, including absent tags.
+    Explicit entrance reports may add a second item for entrance_step_free;
+    they must not be discarded in favour of an unscoped step count.
     Absent tags produce Evidence with present=False and confidence='none'.
     Absence is data, not nothing.
 
@@ -151,14 +150,13 @@ def extract_evidence(
         source_id: OSM element ID as string
         collected_at: When we fetched this data (defaults to now)
     """
-    now = collected_at or datetime.now(timezone.utc)
+    now = _as_utc(collected_at or datetime.now(timezone.utc))
     freshness_days: Optional[int] = None
     if osm_last_edit:
-        # Make both timezone-aware for subtraction
-        if osm_last_edit.tzinfo is None:
-            osm_last_edit = osm_last_edit.replace(tzinfo=timezone.utc)
+        osm_last_edit = _as_utc(osm_last_edit)
         delta = now - osm_last_edit
-        freshness_days = max(0, delta.days)
+        # Future metadata is invalid/unknown, not evidence of freshness.
+        freshness_days = delta.days if delta.total_seconds() >= 0 else None
 
     evidence_list: List[Evidence] = []
 
@@ -175,7 +173,7 @@ def extract_evidence(
 
         present = raw_value is not None
         interpreted = _interpret_osm_value(fact_key, raw_value, matched_tag) if present else "unknown"
-        confidence = _signal_confidence(interpreted, freshness_days) if present else "none"
+        confidence = _signal_confidence(interpreted) if present else "none"
 
         source_detail = (
             f"OSM tag {matched_tag}={raw_value}"
@@ -196,6 +194,16 @@ def extract_evidence(
             observed_at=osm_last_edit,
             freshness_days=freshness_days,
         ))
+        # Preserve an explicit entrance claim alongside the count. The count
+        # may describe another entrance; priority must not erase this report.
+        if (fact_key == "entrance_step_free" and matched_tag == "step_count"
+                and tags.get("entrance", "").strip().lower() == "level"):
+            evidence_list.append(evidence_list[-1].model_copy(update={
+                "raw_value": tags["entrance"],
+                "source_detail": f"OSM tag entrance={tags['entrance']}",
+                "interpreted_value": "yes",
+                "confidence": _signal_confidence("yes"),
+            }))
 
     return evidence_list
 
@@ -207,10 +215,15 @@ def build_provenance(
     """Build a DataProvenance record from an evidence list."""
     present_count = sum(1 for e in evidence if e.present)
     absent_count = sum(1 for e in evidence if not e.present)
-    freshness_days = next((e.freshness_days for e in evidence if e.freshness_days is not None), None)
+    ages = [e.freshness_days for e in evidence]
+    freshness_days = (
+        max(ages) if ages and all(age is not None and age >= 0 for age in ages) else None
+    )
 
     return DataProvenance(
         source_type="osm",
+        collected_at=max((_as_utc(e.collected_at) for e in evidence),
+                         default=datetime.now(timezone.utc)),
         osm_last_edit=osm_last_edit,
         freshness_label=_classify_freshness(freshness_days),
         evidence_checked=len(evidence),
@@ -227,186 +240,133 @@ def score(
     """
     Produce a ScoringOutput from a list of Evidence items.
 
-    Core rules:
-    1. Zero present evidence → verdict: unknown, confidence: none
-    2. wheelchair=no → verdict: unlikely_accessible, confidence: high
-    3. wheelchair=yes + contradictory step evidence → verdict: risky
-    4. wheelchair=yes + supporting evidence → confidence scales with density
-    5. wheelchair=limited → partially_accessible
-    6. No wheelchair tag but other signals present → low confidence unknown
-    7. Freshness degrades confidence
+    Confidence is qualitative, not a probability or field verification.
+    Low is the ceiling until a verification protocol is implemented. Neither
+    Evidence.confidence, source_type, tag counts nor edit dates establish that
+    protocol. Medium/high remain reserved, even for nominally official sources.
+    Source age is reported separately and does not determine confidence.
+    Conflicting interpreted values are retained, never resolved by input order
+    or timestamps (an OSM edit is not a new observation of every property).
+    Unknowns include any absent/uninterpreted input and unresolved conflicts.
+    Evidence count counts distinct present source claims, ignoring collection
+    time so fetching the same claim again does not inflate the count.
 
     This function is pure: no I/O, no side effects.
     """
     if user_needs is None:
         user_needs = {}
 
-    # Index evidence by fact_key for easy lookup
-    by_key = {e.fact_key: e for e in evidence}
-
+    grouped: Dict[str, List[Evidence]] = {}
+    for item in evidence:
+        grouped.setdefault(item.fact_key, []).append(item)
+    values = {
+        key: {e.interpreted_value for e in items
+              if e.present and e.interpreted_value != "unknown"}
+        for key, items in grouped.items()
+    }
+    conflicts = sorted(key for key, choices in values.items() if len(choices) > 1)
+    # Coexisting reports may describe different entrances. This is uncertain
+    # applicability, not proof of logical contradiction or no usable entrance.
+    entrance_scope_uncertain = bool(
+        values.get("entrance_step_free", set())
+        & values.get("step_count", set()) & {"yes", "no"}
+    )
+    # Representatives only select agreed values, not winners between sources.
+    by_key = {
+        key: next(e for e in items if e.present and e.interpreted_value in values[key])
+        for key, items in grouped.items() if len(values[key]) == 1
+    }
     present = [e for e in evidence if e.present]
-    absent_keys = [
-        e.fact_key for e in evidence
-        if not e.present or (
-            e.fact_key in {"entrance_step_free", "step_count", "barrier_present"}
-            and e.interpreted_value == "unknown"
-        )
-    ]
+    known = [e for e in present if e.interpreted_value != "unknown"]
+    unknown_keys = sorted(set(conflicts) | {
+        e.fact_key for e in evidence if not e.present or e.interpreted_value == "unknown"
+    } | ({"entrance_step_free"} if entrance_scope_uncertain else set()))
+    if user_needs.get("step_free_required") and not values.get("entrance_step_free"):
+        unknown_keys = sorted(set(unknown_keys) | {"entrance_step_free"})
 
-    # --- Rule 1: no data at all ---
-    if not present:
-        return ScoringOutput(
-            verdict="unknown",
-            confidence="none",
-            decision_advice="do_not_rely",
-            reasons=[],
-            risks=["No accessibility data found for this location in OpenStreetMap."],
-            unknowns=absent_keys,
-            evidence_count=0,
-        )
+    def finish(verdict: str, risks: List[str]) -> ScoringOutput:
+        """Apply one confidence/advice policy to every verdict branch."""
+        risks = list(risks)
+        requires_steps = user_needs.get("step_free_required", False)
+        confidence = "none" if not known else "low"
+        step_values = values.get("entrance_step_free", set())
+        if requires_steps and (step_values != {"yes"} or entrance_scope_uncertain):
+            risks.append("Step-free entrance is not confirmed. Verify before visiting.")
+        if ("yes" in values.get("step_count", set())
+                or "no" in step_values or "yes" in values.get("barrier_present", set())):
+            risks.append("Sources report steps or a barrier; suitability must be checked.")
+        if any(e.freshness_days is None or e.freshness_days < 0 for e in known):
+            risks.append("Some source ages are unknown; accessibility has not been verified.")
+        if any(_classify_freshness(e.freshness_days) in {"stale", "very_stale"}
+               for e in known):
+            risks.append("Some source records are over two years old; this describes "
+                         "source age, not the date of an accessibility inspection.")
+        if any(e.source_type == "osm" for e in known):
+            risks.append("An OSM edit date is not confirmation of an accessibility inspection.")
+        advice = "verify_first"
+        if confidence == "none":
+            advice = "do_not_rely"
+        # Statements are explicitly attributed to the source, including both
+        # sides of a conflict. No source is silently labelled as verified.
+        claims = sorted({(e.fact_key, e.source_type, e.source_id or "",
+                          e.source_detail, e.raw_value or "", e.interpreted_value)
+                         for e in known})
+        reasons = [Reason(
+            text=f"Source {source} ({source_id or detail}) reports {key}={value}"
+                 f" (raw: {raw}); this is not independent verification.",
+            fact_key=key, source_type=source,
+        ) for key, source, source_id, detail, raw, value in claims]
+        return ScoringOutput(verdict=verdict, confidence=confidence, decision_advice=advice,
+                      reasons=reasons, risks=sorted(set(risks)),
+                      unknowns=unknown_keys,
+                      evidence_count=len({(e.fact_key, e.source_type, e.source_id,
+                                           e.source_detail, e.raw_value, e.interpreted_value)
+                                          for e in present}))
+
+    if conflicts or entrance_scope_uncertain:
+        conflict_risks = [
+            f"Differing source reports for {key}; their applicability is unresolved. Verify before visiting."
+            for key in conflicts if key not in {"entrance_step_free", "step_count"}
+        ]
+        if entrance_scope_uncertain or set(conflicts) & {"entrance_step_free", "step_count"}:
+            conflict_risks.append(
+                "Entrance and step reports may concern different entrances. "
+                "Their relationship is unknown; verify which entrance is usable. "
+                "This is a potential risk, not a confirmed contradiction."
+            )
+        return finish(verdict="risky", risks=conflict_risks)
+
+    # Preserve the existing verdict hierarchy; finish applies policy uniformly.
+    if not known:
+        return finish(verdict="unknown", risks=[
+            "No interpretable accessibility data is available."
+        ])
 
     wc = by_key.get("wheelchair_access")
     step_free = by_key.get("entrance_step_free")
-    ramp = by_key.get("entrance_ramp")
     step_count_ev = by_key.get("step_count")
-
-    # --- Rule 2: explicitly inaccessible ---
-    if wc and wc.present and wc.interpreted_value == "no":
-        return ScoringOutput(
-            verdict="unlikely_accessible",
-            confidence="high",
-            decision_advice="choose_alternative",
-            reasons=[Reason(
-                text="OpenStreetMap records this place as not wheelchair accessible.",
-                fact_key="wheelchair_access",
-                source_type="osm",
-            )],
-            risks=[],
-            unknowns=absent_keys,
-            evidence_count=len(present),
-        )
-
-    # --- Rule 3: risky — contradictory signals ---
-    # wheelchair=yes but steps are also recorded
-    if wc and wc.present and wc.interpreted_value == "yes":
-        has_step_contradiction = (
-            (step_free and step_free.present and step_free.interpreted_value == "no")
-            or (step_count_ev and step_count_ev.present and step_count_ev.interpreted_value == "yes")
-        )
-        if has_step_contradiction:
-            return ScoringOutput(
-                verdict="risky",
-                confidence="low",
-                decision_advice="verify_first",
-                reasons=[Reason(
-                    text="Tagged as wheelchair accessible, but steps are also recorded at this location.",
-                    fact_key="wheelchair_access",
-                    source_type="osm",
-                )],
-                risks=[
-                    "Accessibility tag and entrance data are contradictory. "
-                    "The actual situation is unclear — verify before visiting.",
-                ],
-                unknowns=absent_keys,
-                evidence_count=len(present),
-            )
-
-    # --- Rule 4: wheelchair=yes ---
-    if wc and wc.present and wc.interpreted_value == "yes":
-        reasons: List[Reason] = [Reason(
-            text="Recorded as wheelchair accessible in OpenStreetMap.",
-            fact_key="wheelchair_access",
-            source_type="osm",
-        )]
-        risks: List[str] = []
-
-        # Count supporting positive evidence
-        supporting = [
-            e for e in present
-            if e.fact_key not in {"wheelchair_access", "step_count", "barrier_present"}
-            and e.interpreted_value == "yes"
-        ]
-        for s in supporting:
-            reasons.append(Reason(
-                text=f"Supported by: {s.fact_key.replace('_', ' ')} = {s.raw_value}.",
-                fact_key=s.fact_key,
-                source_type=s.source_type,
-            ))
-
-        # Freshness risk
-        freshness_label = _classify_freshness(wc.freshness_days)
-        if freshness_label in ("stale", "very_stale"):
-            risks.append(
-                f"Accessibility data is more than {wc.freshness_days // 365} year(s) old. "
-                "Conditions may have changed."
-            )
-
-        # Confidence based on signal density + freshness
-        if len(supporting) >= 2 and freshness_label in ("fresh", "recent", "aging"):
-            confidence = "high"
-            decision_advice = "good_option"
-        elif len(supporting) >= 1 or freshness_label in ("fresh", "recent"):
-            confidence = "medium"
-            decision_advice = "verify_first"
-        else:
-            confidence = "low"
-            risks.append(
-                "Only the basic wheelchair tag is recorded. "
-                "Entrance details are not confirmed."
-            )
-            decision_advice = "verify_first"
-
-        # User needs override
-        if user_needs.get("step_free_required") and not (
-            step_free and step_free.present and step_free.interpreted_value == "yes"
-        ):
-            if confidence == "high":
-                confidence = "medium"
-            risks.append("Step-free entrance is not confirmed. Verify before visiting.")
-
-        return ScoringOutput(
-            verdict="likely_accessible",
-            confidence=confidence,
-            decision_advice=decision_advice,
-            reasons=reasons,
-            risks=risks,
-            unknowns=absent_keys,
-            evidence_count=len(present),
-        )
-
-    # --- Rule 5: wheelchair=limited ---
-    if wc and wc.present and wc.interpreted_value == "limited":
-        reasons = [Reason(
-            text="Recorded as having limited wheelchair accessibility — some barriers may be present.",
-            fact_key="wheelchair_access",
-            source_type="osm",
-        )]
-        if ramp and ramp.present and ramp.interpreted_value == "yes":
-            reasons.append(Reason(
-                text="A ramp is recorded at this location.",
-                fact_key="entrance_ramp",
-                source_type="osm",
-            ))
-        return ScoringOutput(
-            verdict="partially_accessible",
-            confidence="medium",
-            decision_advice="verify_first",
-            reasons=reasons,
-            risks=["Limited accessibility may mean a small step, narrow passage, or manual door."],
-            unknowns=absent_keys,
-            evidence_count=len(present),
-        )
-
-    # --- Rule 6: other signals present but no definitive wheelchair tag ---
-    return ScoringOutput(
-        verdict="unknown",
-        confidence="low",
-        decision_advice="verify_first",
-        reasons=[],
-        risks=[
-            f"Accessibility data exists ({len(present)} signal(s)) but is insufficient "
-            "to determine overall wheelchair accessibility."
-        ],
-        unknowns=absent_keys,
-        evidence_count=len(present),
+    has_barrier = (
+        (step_free is not None and step_free.interpreted_value == "no")
+        or (step_count_ev is not None and step_count_ev.interpreted_value == "yes")
+        or values.get("barrier_present") == {"yes"}
     )
+
+    if wc and wc.interpreted_value == "no":
+        return finish(verdict="unlikely_accessible", risks=[])
+    if wc and wc.interpreted_value == "yes":
+        if has_barrier:
+            return finish(verdict="risky", risks=[
+                "Accessibility and barrier reports do not identify a usable entrance. "
+                "Steps may concern a different entrance; verify access before visiting."
+            ])
+        risks = []
+        if not (step_free and step_free.interpreted_value == "yes"):
+            risks.append("Entrance details are not confirmed.")
+        return finish(verdict="likely_accessible", risks=risks)
+    if wc and wc.interpreted_value == "limited":
+        return finish(verdict="partially_accessible", risks=[
+            "The source reports limited accessibility; the exact limitations need verification."
+        ])
+    return finish(verdict="unknown", risks=[
+        "Source reports are insufficient to determine overall wheelchair accessibility."
+    ])
